@@ -1,4 +1,4 @@
-// * 过期的副作用
+// * 合理的触发响应 & reactive
 
 let activeEffect;
 // effect 栈
@@ -8,6 +8,14 @@ let bucket = new WeakMap()
 const jobQueue = new Set()
 // 使用 Promise.resolve() 创建一个 promise 实例，我们用它将一个任务添加到微任务队列
 const p = Promise.resolve()
+
+const ITERATE_KEY = Symbol();
+
+const TriggerType = {
+  SET: 'SET',
+  ADD: 'ADD',
+  DELETE: 'DELETE'
+}
 
 // 一个标志代表是否正在刷新队列
 let isFlushing = false;
@@ -25,6 +33,77 @@ function flushJob () {
   })
 }
 
+// 封装 createReactive 函数，接收一个参数 isShallow，代表是否为浅响应，默认为 false，即非浅响应
+function createReactive (obj, isShallow = false, isReadOnly = false) {
+  return new Proxy(obj, {
+    // 拦截读取操作
+    get (target, key, receiver) {
+      if (key === 'raw') {
+        return target
+      }
+
+      const res = Reflect.get(target, key, receiver)
+
+      if (!isReadOnly) {
+        track(target, key)
+      }
+
+      // 如果是浅响应，则直接返回原始值
+      if (isShallow) {
+        return res
+      }
+      if (typeof res === 'object' && res !== null) {
+        return isReadOnly ? readonly(res) : reactive(res)
+      }
+
+      return res
+    },
+    set (target, key, newVal, receiver) {
+      if (isReadOnly) {
+        console.log(`属性 ${key} 是只读的`);
+        return true
+      }
+      const oldVal = target[key]
+      const type = Object.prototype.hasOwnProperty.call(target, key) ? 'SET' : 'ADD'
+      const res = Reflect.set(target, key, newVal, receiver)
+
+      // target === receiver.raw 说明 receiver 就是 target 的代理对象
+      if (target === receiver.raw) {
+        if (oldVal !== newVal && (oldVal === oldVal || newVal === newVal)) {
+          trigger(target, key, type)
+        }
+      }
+
+      return res
+    },
+    deleteProperty (target, key) {
+      if (isReadOnly) {
+        console.log(`属性 ${key} 是只读的`);
+        return true
+      }
+      const hasKey = Object.prototype.hasOwnProperty.call(target, key)
+      const res = Reflect.deleteProperty(target, key);
+      if (res && hasKey) {
+        trigger(target, key, TriggerType.DELETE)
+      }
+      return res
+    }
+    // 省略其他拦截函数
+  })
+}
+
+function reactive (obj) {
+  return createReactive(obj)
+}
+function shallowReactive (obj) {
+  return createReactive(obj, true)
+}
+function readonly (obj) {
+  return createReactive(obj, false, true)
+}
+function shallowReadonly (obj) {
+  return createReactive(obj, true, true)
+}
 
 const data = {
   foo: 1,
@@ -68,14 +147,52 @@ function cleanup (effectFn) {
 }
 
 const obj = new Proxy(data, {
-  get (target, key) {
+  get (target, key, receiver) {
+    if (key === 'raw') {
+      return target
+    }
+
     track(target, key)
-    return target[key]
+    const res = Reflect.get(target, key, receiver)
+    if (typeof res === 'object' && res !== null) {
+      // 调用 reactive 将结果包装成响应式数据并返回
+      return reactive(res)
+    }
+    return res
+  },
+
+  deleteProperty (target, key) {
+    const hasKey = Object.prototype.hasOwnProperty.call(target, key)
+    // 使用 Reflect.deleteProperty 完成属性的删除
+    const res = Reflect.deleteProperty(target, key)
+    if (res && hasKey) {
+      trigger(target, key, TriggerType.DELETE)
+    }
+    return res;
+  },
+
+  has (target, key) {
+    track(target, key)
+    return Reflect.has(target, key)
+  },
+
+  ownKeys (target) {
+    // 将副作用函数与 ITERATE_KEY 关联
+    track(target, ITERATE_KEY)
+    return Reflect.ownKeys(target)
   },
 
   set (target, key, newVal) {
-    target[key] = newVal
-    trigger(target, key)
+    const oldVal = target[key]
+    // 如果属性不存在，则说明是在添加新属性，否则是设置已有属性
+    const type = Object.prototype.hasOwnProperty.call(target, key) ? TriggerType.SET : TriggerType.ADD
+    // target[key] = newVal
+    const res = Reflect.set(target, key, newVal, receiver)
+    // 解决值是 NaN 的问题 (oldVal === oldVal || newVal === newVal)
+    if (oldVal !== newVal && (oldVal === oldVal || newVal === newVal)) {
+      trigger(target, key, type)
+    }
+    return res;
   }
 })
 
@@ -99,18 +216,29 @@ function track (target, key) {
   activeEffect.deps.push(deps)
 }
 
-function trigger (target, key) {
+function trigger (target, key, type) {
   // 根据 target 从桶中取得 depsMap，它是 key --> effects
   const depsMap = bucket.get(target)
   if (!depsMap) return;
   // 根据 key 取得所有副作用函数 effects
   const effects = depsMap.get(key)
   const effectsToRun = new Set();
+  // 将与 key 相关联的副作用函数添加到 effectsToRun
   effects && effects.forEach(effectFn => {
     if (effectFn !== activeEffect) {
       effectsToRun.add(effectFn)
     }
   })
+  if (type === TriggerType.ADD || type === TriggerType.DELETE) {
+    const iterateEffects = depsMap.get(ITERATE_KEY)
+    // 将与 ITERATE_KEY 相关联的副作用函数也添加到 effectsToRun
+    iterateEffects && iterateEffects.forEach(effectFn => {
+      if (effectFn !== activeEffect) {
+        effectsToRun.add(effectFn)
+      }
+    })
+  }
+
   effectsToRun.forEach(effectFn => {
     if (effectFn.options.scheduler) {
       effectFn.options.scheduler(effectFn)

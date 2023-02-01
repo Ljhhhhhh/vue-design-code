@@ -1,4 +1,4 @@
-// * 过期的副作用
+// * 代理 Object
 
 let activeEffect;
 // effect 栈
@@ -8,6 +8,14 @@ let bucket = new WeakMap()
 const jobQueue = new Set()
 // 使用 Promise.resolve() 创建一个 promise 实例，我们用它将一个任务添加到微任务队列
 const p = Promise.resolve()
+
+const ITERATE_KEY = Symbol();
+
+const TriggerType = {
+  SET: 'SET',
+  ADD: 'ADD',
+  DELETE: 'DELETE'
+}
 
 // 一个标志代表是否正在刷新队列
 let isFlushing = false;
@@ -68,14 +76,39 @@ function cleanup (effectFn) {
 }
 
 const obj = new Proxy(data, {
-  get (target, key) {
+  get (target, key, receiver) {
     track(target, key)
-    return target[key]
+    return Reflect.get(target, key, receiver)
+  },
+
+  deleteProperty (target, key) {
+    const hasKey = Object.prototype.hasOwnProperty.call(target, key)
+    // 使用 Reflect.deleteProperty 完成属性的删除
+    const res = Reflect.deleteProperty(target, key)
+    if (res && hasKey) {
+      trigger(target, key, TriggerType.DELETE)
+    }
+    return res;
+  },
+
+  has (target, key) {
+    track(target, key)
+    return Reflect.has(target, key)
+  },
+
+  ownKeys (target) {
+    // 将副作用函数与 ITERATE_KEY 关联
+    track(target, ITERATE_KEY)
+    return Reflect.ownKeys(target)
   },
 
   set (target, key, newVal) {
-    target[key] = newVal
-    trigger(target, key)
+    // 如果属性不存在，则说明是在添加新属性，否则是设置已有属性
+    const type = Object.prototype.hasOwnProperty.call(target, key) ? TriggerType.SET : TriggerType.ADD
+    // target[key] = newVal
+    const res = Reflect.set(target, key, newVal, receiver)
+    trigger(target, key, type)
+    return res;
   }
 })
 
@@ -99,18 +132,29 @@ function track (target, key) {
   activeEffect.deps.push(deps)
 }
 
-function trigger (target, key) {
+function trigger (target, key, type) {
   // 根据 target 从桶中取得 depsMap，它是 key --> effects
   const depsMap = bucket.get(target)
   if (!depsMap) return;
   // 根据 key 取得所有副作用函数 effects
   const effects = depsMap.get(key)
   const effectsToRun = new Set();
+  // 将与 key 相关联的副作用函数添加到 effectsToRun
   effects && effects.forEach(effectFn => {
     if (effectFn !== activeEffect) {
       effectsToRun.add(effectFn)
     }
   })
+  if (type === TriggerType.ADD || type === TriggerType.DELETE) {
+    const iterateEffects = depsMap.get(ITERATE_KEY)
+    // 将与 ITERATE_KEY 相关联的副作用函数也添加到 effectsToRun
+    iterateEffects && iterateEffects.forEach(effectFn => {
+      if (effectFn !== activeEffect) {
+        effectsToRun.add(effectFn)
+      }
+    })
+  }
+
   effectsToRun.forEach(effectFn => {
     if (effectFn.options.scheduler) {
       effectFn.options.scheduler(effectFn)
